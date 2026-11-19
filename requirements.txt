@@ -1,0 +1,14 @@
+# Install a suitable torch wheel first; see scripts/setup.sh.
+torch==2.6.0
+numpy==1.26.4
+transformers==4.51.3
+accelerate==1.6.0
+huggingface-hub==0.30.2
+safetensors==0.8.0
+sentencepiece==0.2.0
+sacremoses==0.1.1
+matplotlib==3.9.4
+pandas==2.3.3
+pyarrow==25.0.1
+requests==2.34.2
+PyYAML==6.0.3

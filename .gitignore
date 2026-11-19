@@ -1,0 +1,15 @@
+# Runtime assets and experiment outputs are generated locally.
+.venv/
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/data/
+/runs/
+/artifacts/
+.env
+.env.*
+*.safetensors
+*.parquet
+*.sqlite*
+*.zip

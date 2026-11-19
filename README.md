@@ -1,157 +1,117 @@
-# Telephone Game — 실험 프로토콜 요약
+# Telephone Game
 
-동일한 문서에 여러 편집 작업을 적용할 때, **작업 순서가 사실 보존과 편집 요구 충족에 미치는 영향**을 연구한다.
+문서 편집 순서에 따른 사실 보존을 비교하는 **실제 4-role 파일럿 실험 코드**다. 동일한 Qwen 모델을 단순화·압축·교정·구조화 역할로 호출하며, 일곱 순서 선택 방법과 최종 성능·수명·ablation·외부 데이터 이전을 실행한다.
 
-이 문서는 2026-11-19 기준 프로토콜을 요약한다. **1–7절은 기존에 실행한 4-role 영문 파일럿**, **8절은 검토 중인 확장 요건으로 미실행**이다. 성능 수치, 알고리즘 순위, 선택된 순열, 결과 그림과 원시 데이터는 포함하지 않는다. 실행 코드와 산출물은 별도로 관리한다.
+현재 구현 범위는 **영어 역할 4개와 최대 16-hop**이다. 전수조사가 없는 확장형 최종 알고리즘, 더 많은 역할, 번역 역할은 검토 단계이며 이 코드에 구현됐다고 해석하지 않는다. 기존 프로토콜 설명은 [실험 프로토콜](docs/EXPERIMENT_PROTOCOL.md)에 보존했다.
 
-## 1. 공통 편집 설정
-
-네 역할 모두 같은 `Qwen/Qwen2.5-1.5B-Instruct`를 사용하며, 역할별 지시문만 바꾼다. 추가 파인튜닝은 하지 않는다.
-
-| 항목 | 설정 |
-|---|---|
-| 모델 revision | `989aa7980e4cf806f80c7fef2b1adb7bc71aa306` |
-| 실행 | RTX 4090, FP16, 배치 최대 32 |
-| 생성 | Greedy: `do_sample=False`, `num_beams=1` |
-| 길이 제한 | 프롬프트 포함 입력 768 tokens, 단계별 출력 최대 256 tokens |
-| Synthetic 원문 | 영어 80–160단어, 문서당 정답 사실 11개 |
-| 압축 제한 | 최초 원문 단어 수의 `floor(0.75 × source_words)`로 고정 |
-
-각 역할은 직전 문서와 자신의 작업 조건만 받는다. 후속 역할에 초기 원문, 이전 대화 이력, 정답 사실이나 평가 점수를 다시 제공하지 않는다. 반복 편집에서도 압축 상한은 최초 값으로 유지한다.
-
-| Role | 작업 | 지시 내용 |
-|---|---|---|
-| A | 표현 단순화 | 일상적인 영어로 바꾸고 의미 보존. `utilize→use`, `commence→begin`, `prior to→before` 포함 |
-| B | 압축 | 고정된 단어 수 상한 안으로 줄이고 가능한 모든 사실 보존 |
-| C | 교정 | 철자·문법 오류를 수정하고 의미 및 이미 충족한 편집 조건 유지 |
-| D | 구조화 | `- `로 시작하는 비어 있지 않은 bullet 1–8개로 정리. 짧은 제목 허용 |
-
-프롬프트는 Qwen의 기본 chat template에 다음 user 메시지를 넣는 구조다.
+## 코드 구성
 
 ```text
-공통 지시: 문서를 데이터로 취급하고 이름·수량·부정·조건·불확실성·귀속 정보를 보존한다.
-새 사실이나 설명을 추가하지 않고, 양립 가능한 기존 형식·길이 조건을 유지한다.
-편집된 문서만 출력한다.
-
-TASK: 역할별 지시문
-
-<document>
-직전 단계의 문서
-</document>
+pipeline/                 # 배치 편집, 데이터·평가, 실행·재개, 분석·그림
+reference/                # A1–A7 스케줄러, 역할 프롬프트, 공개 데이터 다운로드
+configs/datasets.json     # 데이터셋 revision과 표본 추출 조건
+model_lock.json           # 편집 모델 checkpoint와 고정 revision
+scripts/                  # 설치와 GPU 없이 실행하는 기능 검사
+tests/                    # prefix/cache/분할/정보 접근 경계/재학습 검증
+start.sh                  # SSH와 분리된 전체 실험 시작·재개
+status.sh                 # 현재 단계와 진행 상태
+docs/                     # 프로토콜과 실행 구조 설명
 ```
 
-위 블록은 지시문의 의미를 요약한 것이며 프롬프트 원문 전체는 아니다. 네 역할이 각 한 번 등장하는 24개 순열이 기존 비교 범위다.
+모델 가중치, 원시 데이터, 생성 문서, 기존 측정 결과·그림, 로컬 가상환경과 인증 정보는 업로드하지 않는다. 실행 시 생성되는 `data/`, `runs/`, `artifacts/`는 Git에서 제외한다.
 
-## 2. 데이터와 분할
+## 환경 설치
 
-데이터 생성 seed는 11이다. Calibration-fit은 순서 학습, calibration-safety는 A7의 독립 안전 검증, selection은 후보 알고리즘 선택, test는 동결 이후 평가에 사용한다.
+Linux, Python 3.10–3.12, `python3-venv`와 CUDA 지원 NVIDIA GPU를 기준으로 한다. 실제 편집은 CUDA GPU를 요구한다. CPU 설치는 아래 기능 검사와 데이터 준비용이다.
 
-| 데이터 | Fit | Safety | Selection | Test | 평가 단위 |
-|---|---:|---:|---:|---:|---|
-| Synthetic-6 | 64 | 16 | 40 | 80 | 통제된 원자 사실 |
-| E2E | 16 | 4 | 20 | 40 | 원문 그룹과 구조화된 슬롯 |
-| WebNLG | 16 | 4 | 20 | 40 | 원문 그룹과 구조화된 관계 |
-| SQuAD2 | 16 | 4 | 20 | 40 | 문맥 그룹과 answerable QA |
+```bash
+git clone https://github.com/Doyoung619/Telephone-Game.git
+cd Telephone-Game
+bash scripts/setup.sh
+source .venv/bin/activate
+```
 
-- Synthetic-6는 이름, 수량, 부정, 조건, 불확실성, 귀속 등의 사실과 알려진 편집 오류를 포함한다. 원본 및 압축 상한 이하의 private witness를 사전에 검사한다.
-- 외부 데이터는 공개 train 자료에서 원문 그룹을 나누어 별도 holdout을 구성한다. 같은 그룹의 참고 문장·질문이 분할 사이에 섞이지 않게 한다.
-- 모델에 제공하는 public 문서와 evaluator가 읽는 private 정답을 분리한다.
-- 외부 데이터는 raw 조건이다. Synthetic의 원문 길이·편집 조건·평가 점수를 그대로 적용하거나 합산하지 않는다.
+GPU 없이 코드부터 확인하려면 `bash scripts/setup.sh --cpu`로 설치한다. 설치 스크립트는 실험을 시작하지 않는다. 다른 가상환경을 사용한다면 shell 스크립트에 `TELEPHONE_PYTHON=/path/to/python`을 지정할 수 있다.
 
-## 3. 사실 보존과 편집 점수
+## 실험 없이 기능 검사
 
-주 평가 단위는 entity 문자열의 등장 여부가 아닌 **주어–관계–값을 가진 사실**이다. 예를 들어 리더의 이름, 시험 수량과 기간, 승인 여부, 실행 조건, 가능성과 확정의 구분, 발언 주체를 추적한다.
+```bash
+bash scripts/check.sh
+```
 
-현재 Synthetic evaluator는 통제된 영어 표현에 대한 규칙 검사다. 각 사실을 `preserved`, `missing`, `altered`, `ambiguous`로 분류하고 근거 문장을 저장한다. 이 중 `preserved`만 보존 점수를 받는다.
+이 명령은 통제된 synthetic fixture와 mock editor로 분할·정답/프롬프트 분리·64개 prefix·중단 후 재개·모델 호출 재사용·test fitting 차단을 검사한다. 스케줄러의 수학적 검증과 Python/shell 구문 검사도 포함한다. **모델 다운로드나 실제 LLM/GPU 추론은 하지 않는다.**
 
-$$
-C_{j,t}=\mathbf{1}\{\text{단계 }t\text{에서 사실 }j\text{가 보존되었다고 판정됨}\},\qquad
-F_t=\frac{1}{m}\sum_{j=1}^{m}C_{j,t}.
-$$
+## 데이터와 모델 준비
 
-- **F:** 동일 가중치의 정답 사실 보존 비율.
-- **Q:** 사전에 정한 활성 편집 요구를 충족한 비율. 주 실험은 단순화·압축·교정·구조화 네 조건이다. 단순화·교정은 관련 사실을 삭제해서 통과하지 않도록 일부 내용 보존도 검사한다.
-- **S:** `2FQ / (F + Q)`. 분모가 0이면 0.
-- **Strict success:** `F = 1`이면서 `Q = 1`.
+```bash
+# 다운로드 계획과 고정된 revision만 확인
+python pipeline/prepare.py plan
 
-F는 bit 단위 정보량, Shannon entropy 또는 mutual information의 추정치가 아니다. 새로운 허위 주장 수는 정량 측정하지 않으며 `unsupported_claims = null`로 구분한다. 규칙의 재서술·시제·사건 결합 판정에는 한계가 있으므로, 평가기 검증과 정성 검토를 함께 유지한다.
+# Synthetic 데이터, 공개 데이터 3종, 모델 캐시 및 CPU QA 감사 준비
+python pipeline/prepare.py all --audit-qa
+python pipeline/prepare.py check
+```
 
-외부 평가는 별도 척도다.
+준비 단계는 편집 실험을 실행하지 않는다. `--audit-qa`는 SQuAD calibration 자료에 한해 독립 QA 모델을 CPU에서 실행한다. 인터넷은 공개 가중치·데이터를 받는 데 사용하며 유료 inference API는 사용하지 않는다.
 
-| 데이터 | 평가 방식 |
+부분 준비도 가능하다.
+
+```bash
+python pipeline/prepare.py synthetic
+python pipeline/prepare.py model
+python pipeline/prepare.py external --audit-qa
+# 필요한 Hugging Face 파일이 모두 캐시된 환경
+python pipeline/prepare.py all --offline --audit-qa
+```
+
+기존 파일이나 evaluator가 바뀌었으면 덮어쓰지 않고 오류를 낸다. 다른 프로토콜/코드로 재실행할 때는 별도 체크아웃과 출력 경로를 사용한다.
+
+## GPU 실험 실행·재개
+
+아래 명령부터 실제 편집 모델을 실행한다.
+
+```bash
+# 작은 12문서 smoke만 확인하고 종료
+python pipeline/run_all.py --run runs/smoke --smoke-only
+
+# 전체 파일럿을 독립 세션에서 실행; SSH 종료 후에도 계속 진행
+bash start.sh
+bash status.sh
+tail -f runs/main/runner.log
+tail -f runs/main/finalizer.log
+```
+
+전체 실행은 평가기 검증 → smoke → 후보 비교·동결 → test → 16-hop 수명 → 이론 진단 → ablation → 외부 zero-shot → 비용 분석 → 외부 A1 재학습 → 보고서 생성 순서다. `start.sh`를 다시 호출하면 잠금과 체크포인트를 사용해 재개하며, 완료된 실험은 다시 시작하지 않는다.
+
+외부 재학습은 기존 **A1 고정 프로파일**이다. `prepare.py external`이 외부 test 생성 전에 protocol과 fit ID를 등록한다. 메인 선택이 A1이 아닌 경우 이 확장은 자동으로 다른 알고리즘으로 바꾸지 않고 중단한다. 재학습을 생략하려면 다음 명령을 사용한다.
+
+```bash
+# 처음부터 외부 재학습을 제외하고 실행
+bash start.sh --skip-external-refit
+# 이미 주 실험이 완료됐다면 보고서만 생성
+python pipeline/finalize.py --skip-external-refit
+```
+
+보고서 생성은 주 실험 `status=complete` 상태를 요구한다. 실행 단계와 코드별 역할은 [실행 구조](docs/CODE_GUIDE.md)를 참고한다.
+
+## 생성되는 파일
+
+| 경로 | 내용 |
 |---|---|
-| E2E / WebNLG | 원문에서 확인한 슬롯·관계에 대한 제한된 관계 단서/alias 보존 proxy. 일반적인 의미 함의 정확도로 해석하지 않는다. |
-| SQuAD2 | 독립된 로컬 `deepset/minilm-uncased-squad2`의 추출형 QA EM과 token F1. 정답을 QA 모델 입력에 제공하지 않는다. |
+| `data/paper/` | Synthetic public/private 데이터와 감사·분할 manifest |
+| `data/external/` | 외부 데이터의 그룹 분할과 평가 범위 |
+| `runs/main/journal.sqlite` | 생성 캐시, 단계별 문서/점수, 누적 편집 카운터 |
+| `runs/main/selection/` | 후보 비교와 동결한 정책 |
+| `runs/main/final/`, `lifetime/`, `theory/`, `ablation/` | 개별 문서 결과와 집계 |
+| `runs/main/external/` | 데이터별 zero-shot·재학습 평가 및 동결 기록 |
+| `runs/main/cost/` | 편집·평가·검색 비용과 실패 내역 |
+| `artifacts/Review/` | PNG/PDF 핵심 그림과 전체 모음 |
+| `runs/main/completion_manifest.json` | 전체 보고 완료 기록 |
 
-SQuAD QA 모델 revision은 `934656cdda79824eabf503ed56e15c01ddbdbe3f`로 고정하고 CPU에서 실행한다. 외부 Q/S는 보고하지 않으며, 평가 가능한 정답이 없는 원문은 0점과 구분해 `null` 및 표본 수를 기록한다.
+## 측정과 해석
 
-## 4. 기존 순열 선택 후보
-
-| ID | 방법 | 주요 설정 |
-|---|---|---|
-| A1 | 전체 순열의 경험평균 최대화 | 24개 순열의 평균 S 비교 |
-| A2 | 쌍별 선후관계 회귀 + subset DP | Ridge `0.001` |
-| A3 | 시작·인접·끝 효과 회귀 + DP | Ridge `0.001` |
-| A4 | 사실 표현 상태 전이 + beam search | Beam 폭 4 |
-| A5 | 같은 전이모형 + branch-and-bound | 검색 노드 상한 100,000 |
-| A6 | Scenario별 confidence lower bound의 최악값 최대화 | 길이 120단어 이하/초과 그룹 |
-| A7 | 길이별 정책 + 독립 safety 검증과 fallback | 길이 경계 120, 주 실험 최소 fit leaf 10문서 |
-
-A4/A5의 전이 상태는 `standalone / embedded / LOST`다. 보존 근거 문장을 다른 사실과 공유하는지로 앞의 두 상태를 구분한다. 전이모형은 첫 소실 생존율을 대리 목표로 사용하므로 최종 S와 동일한 목표가 아니다.
-
-기존 비교에서는 모든 후보가 같은 전체 순열/prefix 은행을 공유했다. A2/A3의 DP와 A4/A5의 현재 부분집합 상한 계산에는 지수적 비용이 남아 있다. 이 후보군을 그대로 많은 역할·긴 체인에 확장할 수 있다고 가정하지 않는다.
-
-## 5. 실행 단계
-
-| 단계 | 프로토콜 |
-|---|---|
-| P0: 평가기 검증 | 숫자 변경, 부정 반전, 조건 삭제, 확실성 강화, 귀속자·이름 변경, 누락·재서술을 통제 사례로 검사. 원문 coverage와 근거 문장도 확인 |
-| P1: 후보 비교 | 12문서 smoke 후, calibration/selection의 24개 순열을 생성. Fit에서 후보를 학습하고 독립 selection 평균 S로 알고리즘 선택 후 동결 |
-| E1: 최종 성능 | 동결 방법과 calibration-best fixed, 고정 직관 순서, one-step 손실 기반 heuristic, random-once를 같은 test 문서에서 비교. 원문 복사는 별도 진단 대조군 |
-| E2: 수명 | Test 80문서에서 각 조건을 최대 16-hop까지 실행하고 모든 중간 단계를 평가 |
-| E3: 이론 진단 | 독립 test에서 관측된 순서/prefix의 예측 오차, 전이 가정과 검색 certificate를 점검 |
-| E4: Ablation·비용 | 선택 방법의 부품·calibration 크기·압축·형식 조건과 실제 추론/검색 비용을 구분해 측정 |
-
-Selection의 동률 허용치는 `1e-6`이며 사전 우선순위는 `A1, A2, A3, A6, A7, A4, A5`다. Test 점수로 방법을 재선택하지 않는다. 현재 test의 random-once는 문서마다 사전 추출한 한 순열이며, 전체 24개 순열의 정확한 평균이나 test oracle과 구분한다.
-
-### 수명 실험
-
-비교 조건은 동결 순서, calibration-best fixed, 직관 순서, random-once, random-per-cycle, faithful relay, A/B/C/D 각각의 단독 반복이다. 처음 고른 고정 순서는 4회 반복하고, random-per-cycle은 cycle마다 새 순서를 뽑는다. Relay와 단독 역할은 네 편집 작업을 모두 수행하는 정책과 구분한 기전 대조군이다.
-
-현재 복원율 F와 첫 소실 생존율 U를 별도로 저장한다.
-
-$$
-U_t=\frac{1}{m}\sum_{j=1}^{m}\prod_{s=0}^{t}C_{j,s}.
-$$
-
-평균 F 또는 U가 초기값의 절반 이하가 되는 최초 hop을 각각의 반감기로 정의한다. 관측 범위 안에서 도달하지 않으면 `>16`으로 보고하며 임의의 유한값으로 대체하지 않는다. 사실의 재등장도 기록한다. 평가기의 소실 오판이 U에 누적될 수 있음에 유의한다.
-
-### 외부 이전·재학습 및 ablation
-
-- **Zero-shot 이전:** Synthetic에서 동결한 정책을 외부 test에 적용한다.
-- **Within-dataset refit:** 기존 A1 고정 프로파일을 각 데이터의 fit 16문서에서 외부 F 기준으로 맞춘다. 모든 순열에서 동일하게 평가 가능한 문서만 사용하고 제외 수를 기록한다. 순서 동결 후 test에 적용한다. 외부 safety/selection 분할은 자료에 포함되지만, 현재 이전·재학습 절차의 정책 선택에는 사용하지 않는다.
-- **Ablation:** 사전 고정한 test 24문서 부분집합에서 nested fit 크기 `{6,12,24}`, A1의 24개 대 6개 표본 순열, 압축 비율 `{0.6,0.75,0.9}`, 기본 1–8개 대 정확히 3개 bullet 조건을 비교한다. 해당 조건의 private witness가 길이 상한에 들어가지 않는 사례는 사전 feasibility 기준에 따라 제외 사유를 기록한다.
-
-## 6. 통계·비용·재개
-
-- 문서/group 단위로 paired bootstrap한다. 주 분석은 10,000회(seed 2026), 외부 분석은 5,000회(seed 11)다. 같은 문서의 사실·순열·hop을 독립 표본으로 세지 않는다.
-- 수명 곡선 구간은 pointwise 구간이며, 반감기의 우측 검열을 유지한다. 독립 binary 표본의 strict success가 모두 0 또는 1이면 경계의 정확 이항 구간을 별도로 사용한다.
-- Greedy 한 번의 결과에 생성 seed만 바꿔 독립 반복 표본을 붙이지 않는다.
-- 입력을 조용히 자르지 않는다. 길이 초과·출력 token cap·생성 실패를 기록하고, 유효한 채점 대상의 실패는 사전 규칙에 따라 보수적으로 0점 처리한다.
-- 4-role 전체 은행은 prefix를 공유해 문서당 논리적 편집을 96회에서 64회로 줄인다. 같은 입력의 응답 캐시도 공유한다. 이는 모든 후보에 공통인 실행 최적화다.
-- 논리적 편집 수, 실제 모델 입력 수, batch 호출, token 수, cache hit, GPU 편집과 CPU QA/검색 시간을 구분한다.
-- 모델·프롬프트·evaluator·분할을 고정하고, 배치별 SQLite 체크포인트와 독립 세션의 supervisor로 SSH 종료 후에도 실행·재개할 수 있게 한다.
-
-## 7. 해석 범위
-
-이 프로토콜이 다룬 언어 편집 역할은 4개이며 최대 체인 길이는 16이다. 더 많은 역할에 대한 수학적 모형의 CPU 검색 실험은 실제 다역할 LLM 실험과 구분한다. 고정 전이모형의 검색 certificate를 실제 자연어의 사실 보존이나 모든 순열에 대한 무조건적 보장으로 해석하지 않는다.
-
-## 8. 검토 중인 확장 요건 — 미실행
-
-최근 논의한 장기·다국어 조건은 다음 설계 요건이며, 구현·실험을 완료한 프로토콜이 아니다. 확장형 최종 알고리즘은 아직 선정하지 않았다.
-
-1. **확장성:** 역할 종류 K와 총 단계 T를 분리한다. 학습 때 전체 순열 은행을 요구하지 않고, 검색의 숨은 `2^K` 계산도 제거해야 한다. 제한폭 검색과 표본 전이 학습은 후보 설계다.
-2. **역할 다양성:** 재서술·문체·용어 정규화·문단/목록 변환·번역 등 서로 다른 변환을 추가한다. 역할별 작업 성공과 최종 문서 형식 조건을 구분한다.
-3. **번역 경로:** 언어 `a→b`를 포함하면 최종 결과는 a로 복귀하도록 한다. 현재 언어에서 실행 가능한 역할만 허용하고, 복귀 번역을 단계·계산 예산에 포함한다. 무작위 기준선도 같은 제약을 지킨다.
-4. **다국어 평가:** 중간 언어에서도 동일한 사실 ID, 주어·관계·값·시제·부정·조건을 추적해야 한다. 영어 정규식, 영어 단어 수, 영어 QA 평가기를 그대로 재사용하지 않는다.
-5. **장기 목표:** 짧은 체인의 최종 S와 긴 체인의 사실 보존을 구분한다. 목표 horizon에서의 F/U와 편집 성공, 평가 오류 누적을 함께 검증해야 한다.
+- Synthetic의 F는 규칙 평가기가 판정한 **11개 사실의 보존 비율**이다. bit 단위 정보량이나 상호정보량이 아니다.
+- Q는 편집 요구 충족률이고 S는 F/Q의 조화평균이다. 평가기는 재서술·시제·사건 결합에 한계가 있으며, 알려진 fixture 통과가 일반적인 자연어 정확성을 보장하지 않는다.
+- E2E/WebNLG는 제한된 관계/alias 보존 proxy, SQuAD는 독립 MiniLM의 추출형 QA 점수다. 외부 점수를 Synthetic S와 합산하지 않는다.
+- 모든 후보가 공유한 전체 순열 은행은 기존 4-role 비교를 재현하기 위한 것이다. A2/A3의 DP와 A4/A5의 현재 상한 계산에도 지수적 비용이 남아 있다.
+- 실행 환경에 맞춘 경로/준비/재개 코드 정리 내역은 [이식 내역](docs/PORTING_NOTES.md)에 기록했다. 새로운 GPU 벤치마크 결과는 이 저장소에 포함하지 않는다.

@@ -1,0 +1,35 @@
+{
+  "e2e": {
+    "repo_id": "GEM/e2e_nlg",
+    "split": "train",
+    "filename": "default/train/0000.parquet",
+    "license": "cc-by-sa-4.0",
+    "max_groups": 100,
+    "seed": 11,
+    "min_words": 0,
+    "max_words": null,
+    "revision": "f97230c6d02c1678ec0279be4dea6dc722803a0a"
+  },
+  "webnlg": {
+    "repo_id": "GEM/web_nlg",
+    "split": "train",
+    "filename": "en/train/0000.parquet",
+    "license": "cc-by-nc-4.0",
+    "max_groups": 100,
+    "seed": 11,
+    "min_words": 0,
+    "max_words": null,
+    "revision": "83c75daa12efd1a417bc4920ad9c32b8f04b30d5"
+  },
+  "squad2": {
+    "repo_id": "rajpurkar/squad_v2",
+    "split": "train",
+    "filename": "squad_v2/train-00000-of-00001.parquet",
+    "license": "cc-by-sa-4.0",
+    "max_groups": 100,
+    "seed": 11,
+    "min_words": 0,
+    "max_words": 160,
+    "revision": "3ffb306f725f7d2ce8394bc1873b24868140c412"
+  }
+}
